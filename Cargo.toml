@@ -1,0 +1,20 @@
+[package]
+name = "ferrocache"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+dashmap = "6.0"
+bytes = "1.6"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+tokio-test = "0.4"
+
+[[bench]]
+name = "concurrent_ops"
+harness = false
