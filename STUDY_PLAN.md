@@ -16,9 +16,9 @@ This plan takes you from basics to advanced, ensuring you understand not just WH
 **File:** `src/cache/entry.rs`
 
 **Learning Objectives:**
-- [ ] Understand why we use `Bytes` instead of `Vec<u8>`
-- [ ] Learn what `AtomicU64` provides (and why not `Mutex<u64>`)
-- [ ] Grasp memory accounting strategy
+- [x] Understand why we use `Bytes` instead of `Vec<u8>`
+- [x] Learn what `AtomicU64` provides (and why not `Mutex<u64>`)
+- [x] Grasp memory accounting strategy
 
 **Read This Code:**
 ```rust
@@ -33,19 +33,21 @@ pub struct CacheEntry {
 **Key Questions to Answer:**
 1. Why is `value` a `Bytes` and not `Vec<u8>` or `String`?
    - Hint: Look at how `get()` returns it in storage.rs
+   - Reference-counted, zero-copy cloning (100x faster than Vec<u8> for cache returns)
    
 2. What would happen if we used `Mutex<u64>` instead of `AtomicU64` for generation?
    - Hint: Consider 1000 threads all calling `get()` simultaneously
+   - Lock-free generation tracking, simpler than Mutex, no deadlock risk, perfect for read-heavy workloads
 
 3. Why pre-calculate `size_bytes` instead of computing it each time?
    - Hint: When do we need this value?
+   - Store once, read many times - eliminates millions of repeated calculations
 
 **Hands-On Exercise:**
 ```bash
 # Open Rust playground or local file
 # Try this experiment:
 
-use std::sync::Arc;
 use bytes::Bytes;
 
 // Create a Bytes value
@@ -72,9 +74,9 @@ println!("Clone2:   {:p}", clone2.as_ptr());
 **File:** `src/cache/lru.rs`
 
 **Learning Objectives:**
-- [ ] Understand traditional LRU with linked lists (and why it fails concurrently)
-- [ ] Learn how generation counters provide approximate LRU with O(1) operations
-- [ ] Grasp the trade-off: 95% accuracy for massive concurrency win
+- [x] Understand traditional LRU with linked lists (and why it fails concurrently)
+- [x] Learn how generation counters provide approximate LRU with O(1) operations
+- [x] Grasp the trade-off: 95% accuracy for massive concurrency win
 
 **Traditional LRU Problem:**
 ```
@@ -105,12 +107,15 @@ No locks, just atomic increments
 **Key Questions:**
 1. Why is `Ordering::Relaxed` sufficient for `fetch_add`?
    - Hint: Do we care if thread A's increment happens "before" thread B's in strict order?
+   - We don't care about strict ordering between generations across threads.
    
 2. Why sample 5 random keys instead of finding the global minimum?
    - Hint: Finding global minimum requires scanning all keys
+   - Performance trade-off.
 
 3. What's the worst-case scenario for accuracy?
    - Hint: What if we always sample keys that were just accessed?
+   - Sampling hits only hot keys (recently accessed).
 
 **Hands-On Exercise:**
 Create a test to see sampling accuracy:
@@ -160,9 +165,9 @@ fn test_sampling_accuracy() {
 **File:** `src/cache/storage.rs` (uses DashMap)
 
 **Learning Objectives:**
-- [ ] Understand how DashMap provides concurrent HashMap
-- [ ] Learn about sharding and why it reduces contention
-- [ ] Grasp the difference between `get()` and `get_mut()`
+- [x] Understand how DashMap provides concurrent HashMap
+- [x] Learn about sharding and why it reduces contention
+- [x] Grasp the difference between `get()` and `get_mut()`
 
 **DashMap Architecture:**
 ```
@@ -180,25 +185,30 @@ Default: NUM_CPUS * 4 shards
 **Why This Matters:**
 ```
 Single HashMap with RwLock:
-  Thread 1: get("key1") → Acquire read lock
-  Thread 2: get("key2") → Acquire read lock ← BLOCKED until T1 releases
-  Result: Serialized reads
+  Thread 1: set("key1") → Acquire write lock
+  Thread 2: get("key2") → Try read lock ← BLOCKED (writer holds lock)
+  Thread 3: set("key3") → Try write lock ← BLOCKED
+  Result: Any write serializes everything
 
 DashMap with 16 shards:
-  Thread 1: get("key1") → Lock shard 5
-  Thread 2: get("key2") → Lock shard 12 ← Parallel! Different shards
-  Result: Concurrent reads (usually)
+  Thread 1: set("key1") → Write lock shard 5
+  Thread 2: get("key2") → Read lock shard 12 ← Parallel! Different shards
+  Thread 3: set("key3") → Write lock shard 3 ← Parallel!
+  Result: Only contend if same shard
 ```
 
 **Key Questions:**
 1. When would DashMap show contention?
    - Hint: What if all threads access keys in the same shard? (hotspot scenario)
+   - When multiple threads access keys in the SAME shard
 
 2. Why does `DashMap::get()` return a guard, not the value directly?
    - Hint: What happens if we delete the key while someone holds a reference?
+   - prevents use-after-free
 
 3. How does the number of shards affect performance?
    - Hint: Too few = contention, too many = memory overhead
+   - Trade-off between contention and memory overhead
 
 **Hands-On Exercise:**
 ```rust
@@ -220,7 +230,11 @@ drop(guard);
 
 // Now try to remove while holding guard
 let guard = map.get("key1").unwrap();
-// This would work - remove locks a different lock
+// This works because "key1" and "key2" hash to DIFFERENT shards.
+// get("key1") holds a read lock on shard N, remove("key2") takes a write lock on shard M.
+// Independent locks = no conflict.
+// WARNING: If both keys hashed to the SAME shard, this would deadlock!
+// (Can't acquire write lock while read lock is held on same shard)
 map.remove("key2"); 
 drop(guard);
 ```
@@ -1125,20 +1139,688 @@ By the end, you should be able to:
 
 ---
 
+---
+
+## Phase 7: TCP Server & Command Execution (90 minutes)
+
+### 7.1 Connection Lifecycle - The Full Journey (20 min)
+
+**File:** `src/server/connection.rs`
+
+**Learning Objectives:**
+- [ ] Understand the connection state machine
+- [ ] Learn async I/O patterns with Tokio
+- [ ] Grasp the parse → execute → respond loop
+- [ ] Master error handling strategies
+
+**The Connection State Machine:**
+```
+Client Connects
+    ↓
+[READING] ← Read from TCP socket into buffer
+    ↓
+[PARSING] ← Try to parse complete RESP value
+    ↓
+    ├─> Parse OK → [EXECUTING]
+    ├─> Incomplete → [READING] (need more data)
+    └─> Error → [CLOSING]
+    ↓
+[EXECUTING] ← Convert to command, run against cache
+    ↓
+[WRITING] ← Serialize response, write to socket
+    ↓
+[LOOP] ← Check buffer for pipelined commands
+    ↓
+    ├─> More commands → [PARSING]
+    ├─> Buffer empty → [READING]
+    └─> Client disconnect → [CLOSING]
+```
+
+**Key Questions:**
+1. Why loop back to parsing before reading more data?
+   - Hint: What if 2 commands arrived in one TCP packet?
+
+2. What happens if we read() when data is already in the parser buffer?
+   - Hint: Would we block waiting for data we already have?
+
+3. Why is the buffer `[u8; 4096]` not `Vec<u8>`?
+   - Hint: Stack vs heap allocation, do we need it to grow?
+
+**The Async Pattern:**
+```rust
+async fn run(&mut self) -> Result<()> {
+    let mut buf = [0u8; 4096];  // Stack-allocated buffer
+    
+    loop {
+        match self.parser.parse_value() {
+            Ok(value) => {
+                // We have a complete command!
+                // Don't read from socket yet - buffer might have more
+                let response = self.handle_value(value);
+                self.write_response(response).await?;  // Await!
+            }
+            Err(Incomplete) => {
+                // NOW we need more data
+                let n = self.stream.read(&mut buf).await?;  // Await!
+                if n == 0 { return Ok(()); }  // EOF
+                self.parser.feed(&buf[..n]);
+            }
+            Err(e) => {
+                // Protocol error - close connection
+                return Err(e.into());
+            }
+        }
+    }
+}
+```
+
+**Why async/await?**
+```
+Synchronous (blocking):
+  Thread 1: read() → BLOCKED waiting for network
+  Thread 2: read() → BLOCKED waiting for network
+  Thread 3: read() → BLOCKED waiting for network
+  Result: 3 threads, all idle, wasting memory (1-2MB each)
+
+Asynchronous (Tokio):
+  Task 1: read().await → Yields to executor
+  Task 2: read().await → Yields to executor
+  Task 3: read().await → Yields to executor
+  Result: 1 thread serves all 3, tasks are ~2KB each
+```
+
+**Hands-On Exercise:**
+Add debug output to trace execution:
+```rust
+// Add to src/server/connection.rs run() method
+match self.parser.parse_value() {
+    Ok(value) => {
+        println!("[EXEC] Parsed: {:?}", value);
+        let response = self.handle_value(value);
+        println!("[WRITE] Responding: {:?}", response);
+        self.write_response(response).await?;
+    }
+    Err(Incomplete) => {
+        println!("[READ] Need more data...");
+        let n = self.stream.read(&mut buf).await?;
+        println!("[READ] Got {} bytes", n);
+        // ...
+    }
+}
+```
+
+Then run and watch the flow:
+```bash
+cargo run &
+redis-cli -p 6379 SET key1 value1
+# Watch the state transitions in server output
+```
+
+---
+
+### 7.2 Command Parsing - From Bytes to Types (20 min)
+
+**File:** `src/commands/mod.rs`
+
+**Learning Objectives:**
+- [ ] Understand the two-step parsing (bytes → RespValue → Command)
+- [ ] Learn error handling for malformed commands
+- [ ] Grasp type safety vs protocol flexibility
+
+**The Two-Step Parse:**
+```
+Wire Bytes:  *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+     ↓
+  [Step 1: Protocol Parser]
+     ↓
+RespValue:   Array([BulkString("SET"), BulkString("key"), BulkString("value")])
+     ↓
+  [Step 2: Command Parser]
+     ↓
+RespCommand: Set("key", Bytes("value"), None)
+```
+
+**Why Two Steps?**
+```
+Option 1: Parse directly to Command
+  Pro: Fewer allocations
+  Con: Protocol parser tightly coupled to commands
+  Con: Can't add new commands without changing parser
+
+Option 2: Two-step (our choice)
+  Pro: Protocol parser is generic (reusable)
+  Pro: Easy to add new commands (just update parse_command)
+  Pro: Can inspect raw protocol for debugging
+  Con: Extra allocation of RespValue
+```
+
+**The parse_command() Pattern:**
+```rust
+pub fn parse_command(value: RespValue) -> Result<RespCommand> {
+    // 1. Extract array
+    let parts = match value {
+        RespValue::Array(parts) => parts,
+        _ => return Err(InvalidArgument("expected array")),
+    };
+    
+    // 2. Extract command name
+    let cmd_name = extract_string(&parts[0])?;
+    
+    // 3. Match and validate
+    match cmd_name.to_uppercase().as_str() {
+        "GET" => {
+            if parts.len() != 2 { return Err(WrongArgCount); }
+            let key = extract_string(&parts[1])?;
+            Ok(RespCommand::Get(key))
+        }
+        "SET" => {
+            if parts.len() < 3 { return Err(WrongArgCount); }
+            let key = extract_string(&parts[1])?;
+            let value = extract_bytes(&parts[2])?;
+            
+            // Optional TTL parsing
+            let ttl = if parts.len() >= 5 {
+                // Parse "EX 60"
+                Some(extract_integer(&parts[4])? as u64)
+            } else { None };
+            
+            Ok(RespCommand::Set(key, value, ttl))
+        }
+        _ => Err(UnknownCommand(cmd_name))
+    }
+}
+```
+
+**Key Questions:**
+1. Why `to_uppercase()` on the command name?
+   - Hint: Redis accepts "GET", "get", "GeT" - all the same
+
+2. Why return `Result<RespCommand, CommandError>` not `Option<RespCommand>`?
+   - Hint: What's the difference between "unknown command" and "wrong arg count"?
+
+3. Why is TTL `Option<u64>` not just `u64`?
+   - Hint: What if user doesn't specify "EX"?
+
+**Common Parsing Pitfalls:**
+```rust
+// WRONG - panics on invalid UTF-8
+let key = String::from_utf8(bytes.to_vec()).unwrap();
+
+// CORRECT - returns error
+let key = String::from_utf8(bytes.to_vec())
+    .map_err(|_| CommandError::InvalidArgument("invalid UTF-8".to_string()))?;
+
+// WRONG - index out of bounds if args < 2
+let key = &parts[1];
+
+// CORRECT - check length first
+if parts.len() < 2 { return Err(WrongArgCount); }
+let key = &parts[1];
+```
+
+**Hands-On Exercise:**
+Add a new command - `INCR key`:
+```rust
+// 1. Add to RespCommand enum in src/protocol/mod.rs
+#[derive(Debug, Clone, PartialEq)]
+pub enum RespCommand {
+    // ... existing commands
+    Incr(String),  // Add this
+}
+
+// 2. Add to parse_command() in src/commands/mod.rs
+"INCR" => {
+    if parts.len() != 2 { return Err(WrongArgCount); }
+    let key = extract_string(&parts[1])?;
+    Ok(RespCommand::Incr(key))
+}
+
+// 3. Add to execute_command() in src/commands/handlers.rs
+RespCommand::Incr(key) => {
+    // Try to get current value, parse as int, increment
+    match cache.get(&key) {
+        Some(bytes) => {
+            let val = String::from_utf8_lossy(&bytes).parse::<i64>()
+                .unwrap_or(0);
+            let new_val = val + 1;
+            cache.set(key, Bytes::from(new_val.to_string()), None);
+            RespValue::Integer(new_val)
+        }
+        None => {
+            cache.set(key.clone(), Bytes::from("1"), None);
+            RespValue::Integer(1)
+        }
+    }
+}
+
+// 4. Test it!
+// redis-cli -p 6379 INCR counter
+```
+
+---
+
+### 7.3 The Deadlock Bug - A Debugging Story (15 min)
+
+**Learning Objective:** Understand read-write lock conflicts
+
+**The Bug:**
+When we implemented `EXPIRE`, the server would hang forever. Here's what happened:
+
+**Buggy Code:**
+```rust
+pub fn set_expiration(&self, key: &str, ttl: Duration) -> bool {
+    if let Some(old_entry) = self.store.get(key) {
+        // ← READ LOCK ACQUIRED on shard N
+        
+        let new_entry = Arc::new(CacheEntry::new(
+            old_entry.value.clone(),
+            Some(Instant::now() + ttl),
+            generation,
+            key.len(),
+        ));
+        
+        // Still holding read lock...
+        self.store.insert(key.to_string(), new_entry);
+        // ← Tries to acquire WRITE LOCK on shard N
+        // DEADLOCK! Can't get write lock while holding read lock
+        
+        true
+    } else {
+        false
+    }
+}
+```
+
+**Why This Deadlocks:**
+```
+DashMap internals:
+  - get(key) → RwLock::read() on shard
+  - insert(key) → RwLock::write() on shard
+  
+RwLock rules:
+  - Multiple readers OK
+  - One writer OK (when no readers)
+  - Writer CANNOT acquire lock while ANY reader exists
+  
+Our bug:
+  Thread holds read lock
+  Thread tries to get write lock on SAME shard
+  Write lock waits for read lock to drop
+  Read lock held by... the same thread!
+  DEADLOCK!
+```
+
+**The Fix:**
+```rust
+pub fn set_expiration(&self, key: &str, ttl: Duration) -> bool {
+    // Step 1: Clone what we need under read lock
+    let value = if let Some(old_entry) = self.store.get(key) {
+        old_entry.value.clone()  // Bytes::clone is cheap (Arc)
+    } else {
+        return false;
+    };
+    // ← Read lock DROPPED here (guard out of scope)
+    
+    // Step 2: Now safe to acquire write lock
+    let new_entry = Arc::new(CacheEntry::new(/* ... */));
+    self.store.insert(key.to_string(), new_entry);
+    // ← Write lock acquired successfully
+    
+    true
+}
+```
+
+**Key Insight:** Always acquire locks in order: read → drop → write. Never hold a read lock while trying to get a write lock on the same resource.
+
+**Similar Patterns to Watch For:**
+```rust
+// DEADLOCK - read while holding read
+let entry1 = map.get("key1");
+let entry2 = map.get("key1");  // Different guard, same shard - OK
+
+// DEADLOCK - write while holding read
+let entry = map.get("key");
+map.insert("key", new_value);  // BAD!
+
+// OK - explicit drop
+let entry = map.get("key");
+let data = entry.value.clone();
+drop(entry);  // Explicit!
+map.insert("key", new_value);  // Now safe
+```
+
+**Debugging Exercise:**
+Add this test to see the deadlock (don't commit!):
+```rust
+#[test]
+#[should_panic]  // This will timeout/hang
+fn test_deadlock_scenario() {
+    let cache = CacheStorage::new(1024);
+    cache.set("key".to_string(), Bytes::from("value"), None);
+    
+    // This will deadlock if bug is present
+    std::thread::spawn(move || {
+        cache.set_expiration("key", Duration::from_secs(60));
+    }).join().unwrap();
+}
+```
+
+---
+
+### 7.4 Error Handling Layers (15 min)
+
+**Learning Objective:** Understand where and how to handle different error types
+
+**The Error Stack:**
+```
+┌─────────────────────────────────────┐
+│  Client Sends Bad Data              │
+└───────────┬─────────────────────────┘
+            ↓
+┌─────────────────────────────────────┐
+│  Layer 1: Protocol Parser           │
+│  RespError::InvalidFormat           │
+│  → Send error, close connection     │
+└───────────┬─────────────────────────┘
+            ↓
+┌─────────────────────────────────────┐
+│  Layer 2: Command Parser            │
+│  CommandError::UnknownCommand       │
+│  → Send "-ERR unknown command"      │
+│  → Keep connection open             │
+└───────────┬─────────────────────────┘
+            ↓
+┌─────────────────────────────────────┐
+│  Layer 3: Command Executor          │
+│  (Cache operations don't error)     │
+│  → Always returns RespValue         │
+└───────────┬─────────────────────────┘
+            ↓
+┌─────────────────────────────────────┐
+│  Layer 4: Network I/O               │
+│  io::Error (connection lost)        │
+│  → Close connection, log            │
+└─────────────────────────────────────┘
+```
+
+**Error Recovery Matrix:**
+
+| Error Type | Action | Keep Connection? | Example |
+|------------|--------|------------------|---------|
+| `RespError::Incomplete` | Read more data | ✓ Yes | Partial command received |
+| `RespError::InvalidFormat` | Send error, close | ✗ No | Malformed RESP |
+| `CommandError::UnknownCommand` | Send error | ✓ Yes | `ZADD` (unsupported) |
+| `CommandError::WrongArgCount` | Send error | ✓ Yes | `GET` (no key) |
+| `io::Error` (write) | Log, close | ✗ No | Client disconnected |
+| Cache error | N/A | N/A | Cache ops don't fail |
+
+**The handle_value() Pattern:**
+```rust
+fn handle_value(&self, value: RespValue) -> RespValue {
+    match parse_command(value) {
+        Ok(command) => {
+            // Command is valid, execute it
+            execute_command(&self.cache, command)
+            // execute_command always returns RespValue (never fails)
+        }
+        Err(CommandError::WrongArgCount) => {
+            RespValue::Error("ERR wrong number of arguments".to_string())
+        }
+        Err(CommandError::UnknownCommand(cmd)) => {
+            RespValue::Error(format!("ERR unknown command '{}'", cmd))
+        }
+        Err(CommandError::InvalidArgument(msg)) => {
+            RespValue::Error(format!("ERR {}", msg))
+        }
+    }
+    // Note: We return RespValue, never panic or propagate error
+    // Connection stays open!
+}
+```
+
+**Key Questions:**
+1. Why doesn't execute_command() return `Result<RespValue, Error>`?
+   - Hint: Can cache.get() fail? What would "failure" mean?
+
+2. Why close connection on parse error but not command error?
+   - Hint: If RESP is malformed, what's the state of the parser buffer?
+
+3. What happens if write_response() fails?
+   - Hint: Can we send an error response if the socket is broken?
+
+**Hands-On Exercise:**
+Test error handling:
+```bash
+# Terminal 1
+cargo run
+
+# Terminal 2
+# Send valid commands
+redis-cli -p 6379 GET mykey  # Should work
+
+# Send command with wrong args
+redis-cli -p 6379 GET  # Should get "-ERR wrong number of arguments"
+
+# Send unknown command
+redis-cli -p 6379 ZADD  # Should get "-ERR unknown command 'ZADD'"
+
+# Connection should still be alive after errors!
+redis-cli -p 6379 PING  # Should work
+```
+
+---
+
+### 7.5 Server Orchestration & Shutdown (20 min)
+
+**File:** `src/server/mod.rs`, `src/main.rs`
+
+**Learning Objectives:**
+- [ ] Understand the accept loop pattern
+- [ ] Learn broadcast channels for shutdown signaling
+- [ ] Grasp graceful vs forceful shutdown
+
+**The Server Architecture:**
+```
+main()
+  │
+  ├─> Create Arc<Server>
+  ├─> Spawn reaper task (background)
+  └─> tokio::spawn(server.run())
+      └─> Accept loop
+
+server.run()
+  │
+  ├─> Bind TcpListener
+  └─> loop {
+        tokio::select! {
+          stream = listener.accept() => {
+            spawn Connection::handle(stream, cache)
+          }
+          _ = shutdown_rx.recv() => {
+            break  // Exit loop, shutdown
+          }
+        }
+      }
+```
+
+**The Shutdown Pattern:**
+```rust
+// In Server::new()
+let (shutdown_tx, _) = broadcast::channel(1);
+
+// In Server::run()
+let mut shutdown_rx = self.shutdown_tx.subscribe();
+loop {
+    tokio::select! {
+        // ... accept connections ...
+        _ = shutdown_rx.recv() => {
+            println!("Shutting down...");
+            break;
+        }
+    }
+}
+
+// In main()
+signal::ctrl_c().await?;
+server.shutdown();  // Broadcasts to all subscribers
+```
+
+**Why broadcast channel?**
+```
+Alternative 1: Shared bool with AtomicBool
+  Pro: Simple
+  Con: Need to poll it (busy wait or sleep)
+  Con: Hard to wake up blocked tasks
+
+Alternative 2: Broadcast channel (our choice)
+  Pro: Async notification (no polling)
+  Pro: Multiple subscribers (each connection gets signal)
+  Pro: Integrates with tokio::select!
+```
+
+**Shutdown Sequence:**
+```
+User presses Ctrl+C
+    ↓
+main() receives signal
+    ↓
+server.shutdown() → broadcast::send(())
+    ↓
+    ├─> Server accept loop: shutdown_rx.recv() → break
+    │   (Stops accepting new connections)
+    │
+    └─> Each connection task: shutdown_rx.recv() → exit
+        (Active connections close)
+    ↓
+main() waits with timeout (2 sec)
+    ↓
+    ├─> Connections finish → clean exit
+    └─> Timeout → force exit
+```
+
+**Key Questions:**
+1. Why `Arc<Server>` instead of moving Server into the task?
+   - Hint: How do we call server.shutdown() if it's been moved?
+
+2. What happens if a connection is processing a long command when shutdown arrives?
+   - Hint: Look at the select! in Connection::handle() spawn
+
+3. Why have a shutdown timeout?
+   - Hint: What if a connection is stuck waiting for a client that never responds?
+
+**The tokio::select! Macro:**
+```rust
+tokio::select! {
+    result = connection.handle() => {
+        // Connection finished normally
+    }
+    _ = shutdown_rx.recv() => {
+        // Shutdown signal received, exit early
+    }
+}
+```
+**How it works:** Waits for the FIRST branch to complete, then cancels the others.
+
+**Hands-On Exercise:**
+Test graceful shutdown:
+```bash
+# Terminal 1
+cargo run
+
+# Terminal 2 - start a long operation
+redis-cli -p 6379
+> SET key1 value1
+> SET key2 value2
+(leave it connected)
+
+# Terminal 1 - press Ctrl+C
+# Watch the output:
+# - "Shutting down..." appears
+# - Active connections get notification
+# - Server exits within 2 seconds
+```
+
+---
+
+## Phase 8: Performance Testing Deep Dive (Optional - 30 minutes)
+
+### 8.1 Understanding redis-benchmark
+
+**What it does:**
+- Sends thousands of commands
+- Measures latency and throughput
+- Tests different scenarios (pipelining, concurrency)
+
+**Reading the output:**
+```
+SET: 75000.00 requests per second
+     ^^^^^^^^
+     Throughput
+     
+GET: 80000.00 requests per second, p50=0.1 msec
+                                    ^^^^^^^^^^
+                                    Latency percentiles
+```
+
+**Key metrics:**
+- **Throughput (req/sec)**: Higher is better
+- **Latency p50 (median)**: Typical case
+- **Latency p99**: Worst case (important for UX)
+
+**Pipelining effect:**
+```
+Without pipelining (-P 1): 40k req/sec
+With pipelining (-P 16):   200k req/sec
+
+Why 5x faster?
+- No network round-trip between commands
+- Amortizes TCP overhead
+- Better CPU cache utilization
+```
+
+### 8.2 Comparing to Redis
+
+```bash
+# Test FerroCache
+redis-benchmark -p 6379 -t get,set -n 100000 -q
+
+# Test real Redis (if installed)
+redis-benchmark -p 6380 -t get,set -n 100000 -q
+
+# Expected: FerroCache is slower (it's a learning project!)
+# Good targets:
+#   - 50k-100k ops/sec for GET/SET
+#   - 200k+ ops/sec with pipelining
+```
+
+---
+
 ## Next Steps
 
-After completing this study plan, you'll have a deep understanding of:
+After completing Phases 1-7, you'll have a deep understanding of:
 - Concurrent data structures (DashMap, atomics)
 - Lock-free algorithms (generation counters)
-- Async programming (Tokio, background tasks)
+- Async programming (Tokio, background tasks, select!)
 - Streaming parsers (RESP protocol)
 - Property-based testing (proptest)
 - Performance engineering (benchmarking, profiling)
+- TCP server architecture
+- Command execution pipelines
+- Error handling strategies
+- Deadlock prevention
+- Graceful shutdown patterns
 
-You'll be ready to:
-1. Modify the cache engine confidently
-2. Add new features (TTL, eviction policies)
-3. Debug performance issues
-4. Move on to Phase 2 (TCP server, command handlers)
+**You'll be ready to:**
+1. Add new commands confidently
+2. Debug connection issues
+3. Optimize performance bottlenecks
+4. Move on to Layer 5 (Observability - metrics, tracing, health checks)
+
+**Current Project Status:** ~70% complete
+- ✅ Layer 1: Cache Engine
+- ✅ Layer 2: Protocol
+- ✅ Layer 3: Server & Concurrency
+- ⏭️ Layer 5: Observability
+- ⏭️ Layer 6: Deployment
 
 Good luck! 🚀

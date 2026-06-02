@@ -89,7 +89,7 @@ mod tests {
 
         let candidates = vec![
             ("key1".to_string(), 100),
-            ("key2".to_string(), 50),  // Lowest - should be selected
+            ("key2".to_string(), 50), // Lowest - should be selected
             ("key3".to_string(), 75),
             ("key4".to_string(), 200),
         ];
@@ -117,8 +117,8 @@ mod tests {
         // key2 should be evicted (lowest generation)
 
         let _gen_key1_first = tracker.next_generation(); // 0
-        let gen_key2 = tracker.next_generation();       // 1
-        let gen_key3 = tracker.next_generation();       // 2
+        let gen_key2 = tracker.next_generation(); // 1
+        let gen_key3 = tracker.next_generation(); // 2
         let gen_key1_second = tracker.next_generation(); // 3
 
         let candidates = vec![
@@ -207,5 +207,36 @@ mod tests {
         let victim2 = tracker.select_victim(&all_keys);
         assert!(victim2 == "key2" || victim2 == "key4");
         assert_ne!(victim1, victim2);
+    }
+
+    #[test]
+    fn test_sampling_accuracy() {
+        let tracker = LruTracker::new();
+
+        // Create entries with generations: 1, 2, 3, ..., 100
+        let mut keys = vec![];
+        for i in 1..=100 {
+            keys.push((format!("key{}", i), i as u64));
+        }
+
+        // Sample 5 random keys 1000 times
+        // The victim should usually be from the bottom 20%
+        let mut low_gen_count = 0;
+        for _ in 0..1000 {
+            // Randomly sample 5 keys
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            let sample: Vec<_> = keys.choose_multiple(&mut rng, 5).cloned().collect();
+
+            let victim = tracker.select_victim(&sample);
+            let (_, gen) = sample.iter().find(|(k, _)| k == &victim).unwrap();
+
+            if *gen <= 20 {
+                low_gen_count += 1;
+            }
+        }
+
+        println!("Victims from bottom 20%: {}/1000", low_gen_count);
+        // Should be much higher than 200 (20% random chance)
     }
 }

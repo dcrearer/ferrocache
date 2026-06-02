@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A cache entry containing the value, expiration time, access generation for LRU,
 /// and size tracking for memory budgeting.
@@ -60,6 +60,22 @@ impl CacheEntry {
     /// Get the current access generation
     pub fn generation(&self) -> u64 {
         self.access_generation.load(Ordering::Relaxed)
+    }
+
+    /// Get time to live (remaining duration until expiration)
+    ///
+    /// Returns:
+    /// - Some(duration) if entry has expiration and hasn't expired
+    /// - None if entry has no expiration
+    pub fn time_to_live(&self) -> Option<Duration> {
+        self.expires_at.and_then(|exp| {
+            let now = Instant::now();
+            if exp > now {
+                Some(exp - now)
+            } else {
+                Some(Duration::from_secs(0)) // Expired, but return 0 instead of None
+            }
+        })
     }
 }
 

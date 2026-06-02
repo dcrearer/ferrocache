@@ -88,7 +88,7 @@ impl CacheStorage {
         let entry_size = CacheEntry::calculate_size(&value, key.len());
 
         // Evict entries if needed to make room
-        while self.memory_used.load(Ordering::Relaxed) + entry_size > self.memory_limit
+        while self.memory_used.load(Ordering::Relaxed).saturating_add(entry_size) > self.memory_limit
             && !self.store.is_empty()
         {
             self.evict_one();
@@ -104,8 +104,7 @@ impl CacheStorage {
                 .fetch_sub(old_entry.size_bytes, Ordering::Relaxed);
         }
 
-        self.memory_used
-            .fetch_add(entry_size, Ordering::Relaxed);
+        self.memory_used.fetch_add(entry_size, Ordering::Relaxed);
     }
 
     /// Remove a key from the cache
@@ -119,6 +118,52 @@ impl CacheStorage {
         } else {
             false
         }
+    }
+
+    /// Set expiration on an existing key
+    ///
+    /// Returns true if key existed and expiration was set, false if key not found
+    ///
+    /// Implementation note: Creates a new entry with updated expiration
+    pub fn set_expiration(&self, key: &str, ttl: Duration) -> bool {
+        // Clone the value while holding the read lock, then drop the lock
+        let value = if let Some(old_entry) = self.store.get(key) {
+            old_entry.value.clone()
+        } else {
+            return false;
+        };
+        // Read lock is dropped here
+
+        // Now we can safely acquire write lock for insert
+        let generation = self.lru.next_generation();
+        let new_entry = Arc::new(CacheEntry::new(
+            value,
+            Some(Instant::now() + ttl),
+            generation,
+            key.len(),
+        ));
+
+        self.store.insert(key.to_string(), new_entry);
+        true
+    }
+
+    /// Get TTL for a key
+    ///
+    /// Returns:
+    /// - Some(Some(duration)) if key exists and has TTL
+    /// - Some(None) if key exists but has no TTL
+    /// - None if key doesn't exist
+    pub fn get_ttl(&self, key: &str) -> Option<Option<Duration>> {
+        let entry = self.store.get(key)?;
+
+        // Check if expired (lazy expiration)
+        if entry.is_expired() {
+            drop(entry);
+            self.remove(key);
+            return None;
+        }
+
+        Some(entry.time_to_live())
     }
 
     /// Evict one entry using LRU sampling

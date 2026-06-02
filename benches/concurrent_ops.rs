@@ -9,102 +9,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ferrocache::cache::storage::CacheStorage;
 use bytes::Bytes;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// Benchmark: Read-heavy with proper thread reuse
-///
-/// ## Improvements over original:
-/// - Threads created once, reused across iterations
-/// - Barrier ensures all threads start simultaneously
-/// - Only measures actual cache operations, not thread overhead
-fn bench_read_heavy_fixed(c: &mut Criterion) {
-    let mut group = c.benchmark_group("read_heavy_fixed");
-
-    for num_threads in [1, 2, 4, 8, 16] {
-        // Operations per iteration
-        const OPS_PER_THREAD: u64 = 10_000;
-        group.throughput(Throughput::Elements(OPS_PER_THREAD * num_threads));
-
-        group.bench_with_input(
-            BenchmarkId::from_parameter(num_threads),
-            &num_threads,
-            |b, &threads| {
-                // Setup: Create cache ONCE (outside iteration)
-                let cache = Arc::new(CacheStorage::new(10 * 1024 * 1024));
-
-                // Pre-populate with test data
-                for i in 0..100 {
-                    cache.set(
-                        format!("key{}", i),
-                        Bytes::from(format!("value{}", i)),
-                        None,
-                    );
-                }
-
-                // Pre-spawn threads with barrier pattern
-                let barrier = Arc::new(Barrier::new(threads as usize + 1)); // +1 for main thread
-
-                let handles: Vec<_> = (0..threads)
-                    .map(|thread_id| {
-                        let cache = cache.clone();
-                        let barrier = barrier.clone();
-
-                        std::thread::spawn(move || {
-                            loop {
-                                // Wait for signal to start
-                                barrier.wait();
-
-                                // Do the actual work
-                                for i in 0..OPS_PER_THREAD {
-                                    let key_num = (thread_id * OPS_PER_THREAD + i) % 100;
-                                    let key = format!("key{}", key_num);
-
-                                    if i % 10 == 0 {
-                                        // 10% writes
-                                        cache.set(key, Bytes::from("value"), None);
-                                    } else {
-                                        // 90% reads
-                                        black_box(cache.get(&key));
-                                    }
-                                }
-
-                                // Signal completion and check for exit
-                                if barrier.wait().is_leader() {
-                                    // Leader thread checks if we should exit
-                                    // This is signaled by benchmark completion
-                                    break;
-                                }
-                            }
-                        })
-                    })
-                    .collect();
-
-                // Now measure ONLY the actual work
-                b.iter(|| {
-                    // Signal all threads to start
-                    barrier.wait();
-
-                    // Wait for all threads to complete
-                    barrier.wait();
-
-                    // Work is done! This is all we measure.
-                });
-
-                // Cleanup: Signal threads to exit
-                // (This happens after benchmark completes)
-                drop(barrier);
-                for handle in handles {
-                    handle.join().ok();
-                }
-            },
-        );
-    }
-
-    group.finish();
-}
-
-/// Benchmark: Alternative approach using scoped threads (simpler)
+/// Benchmark: Scoped threads approach (simple & correct)
 ///
 /// ## Why scoped threads?
 /// - Automatically join on scope exit
@@ -292,7 +200,7 @@ criterion_group! {
     targets =
         bench_single_threaded_fixed,
         bench_read_heavy_scoped,        // Recommended (simple & correct)
-        bench_read_heavy_fixed,         // Advanced (barrier pattern)
+        // bench_read_heavy_fixed,      // DISABLED - barrier pattern has exit bug
         bench_comparison,               // Shows the difference
         bench_thread_spawn_overhead,    // Measures overhead directly
 }
