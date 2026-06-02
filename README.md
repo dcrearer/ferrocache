@@ -88,6 +88,7 @@ These are documented to show understanding of the full problem space.
 - [CLAUDE.md](CLAUDE.md) - Project context for Claude Code
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Detailed technical design
 - [PROJECT_PLAN.md](PROJECT_PLAN.md) - Development roadmap
+- [STUDY_PLAN.md](STUDY_PLAN.md) - Interactive learning guide (3-4 hours)
 - [CLAUDE_WORKFLOW.md](docs/CLAUDE_WORKFLOW.md) - Working with Claude Code
 
 ## License
