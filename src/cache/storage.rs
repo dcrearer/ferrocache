@@ -88,7 +88,11 @@ impl CacheStorage {
         let entry_size = CacheEntry::calculate_size(&value, key.len());
 
         // Evict entries if needed to make room
-        while self.memory_used.load(Ordering::Relaxed).saturating_add(entry_size) > self.memory_limit
+        while self
+            .memory_used
+            .load(Ordering::Relaxed)
+            .saturating_add(entry_size)
+            > self.memory_limit
             && !self.store.is_empty()
         {
             self.evict_one();
@@ -385,6 +389,39 @@ mod tests {
         }
 
         // Memory should stay under limit despite concurrent writes
+        assert!(cache.memory_used() <= cache.memory_limit());
+    }
+
+    #[test]
+    fn test_eviction_with_debug() {
+        let cache = CacheStorage::new(256); // Small cache
+
+        // Insert entries with tracking
+        for i in 0..20 {
+            println!(
+                "Before insert {}: memory = {}/{}",
+                i,
+                cache.memory_used(),
+                cache.memory_limit()
+            );
+            cache.set(format!("key{}", i), Bytes::from("value"), None);
+            println!(
+                "After insert {}: memory = {}/{}, len = {}",
+                i,
+                cache.memory_used(),
+                cache.memory_limit(),
+                cache.len()
+            );
+        }
+
+        // Should have evicted several entries
+        println!(
+            "Final: len = {}, memory = {}/{}",
+            cache.len(),
+            cache.memory_used(),
+            cache.memory_limit()
+        );
+        assert!(cache.len() < 20);
         assert!(cache.memory_used() <= cache.memory_limit());
     }
 }

@@ -219,6 +219,7 @@ let map = DashMap::new();
 
 // Insert data
 map.insert("key1", "value1");
+map.insert("key2", "value2");
 
 // get() returns a Ref guard
 let guard = map.get("key1").unwrap();
@@ -246,9 +247,9 @@ drop(guard);
 **File:** `src/cache/storage.rs`
 
 **Learning Objectives:**
-- [ ] Understand the interplay between DashMap, LRU, and memory tracking
-- [ ] Learn the eviction algorithm
-- [ ] Grasp lazy expiration vs background reaper roles
+- [x] Understand the interplay between DashMap, LRU, and memory tracking
+- [x] Learn the eviction algorithm
+- [x] Grasp lazy expiration vs background reaper roles
 
 **The Complete Flow:**
 
@@ -304,16 +305,20 @@ pub fn set(&self, key: String, value: Bytes, ttl: Option<Duration>) {
 **Key Questions:**
 1. Why do we `drop(entry)` before calling `remove()` in the expiration check?
    - Hint: What happens if we hold a read lock while trying to acquire a write lock?
+   - store.get() returns a guard holding a READ lock on the shard. remove() needs a WRITE lock on the same shard. If we don't drop the read   lock first, we deadlock (thread waits for itself to release the lock).
 
 2. Why evict in a loop (`while`) instead of just once?
    - Hint: What if we need to evict multiple entries to make room?
+   - One eviction might not free enough space!
 
 3. Why wrap `CacheEntry` in `Arc`?
    - Hint: DashMap stores `Arc<CacheEntry>`, so `get()` can return a clone
+   - So get() can return a cheap clone without holding locks
 
 4. What race condition exists between checking memory and inserting?
    - Hint: What if two threads both see "memory available" and both insert?
    - Is this acceptable for a cache?
+   - YES, this is acceptable for a cache!
 
 **Hands-On Exercise:**
 Run the eviction test with debug output:
