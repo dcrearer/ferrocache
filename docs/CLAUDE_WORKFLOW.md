@@ -66,9 +66,8 @@ When ready to start implementation:
 ### Memory & Context
 
 Claude has access to:
-- Your project architecture (CLAUDE.md)
+- Your project architecture and layer roadmap (CLAUDE.md)
 - Detailed architecture docs (docs/ARCHITECTURE.md)
-- Development plan (PROJECT_PLAN.md)
 - Your original design outline (referenced in memory)
 
 If Claude seems to forget context:
@@ -87,7 +86,7 @@ If Claude seems to forget context:
 1. **Start small:** Implement one component at a time
 2. **Test as you go:** Ask for tests immediately after implementation
 3. **Benchmark early:** Profile and optimize based on data
-4. **Document decisions:** Update technical decisions log in PROJECT_PLAN.md
+4. **Document decisions:** Record key technical decisions in CLAUDE.md
 5. **Refer to sources:** "Implement this using the techniques from *Rust Atomics and Locks* chapter 5"
 
 ### Example Workflow

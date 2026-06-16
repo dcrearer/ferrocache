@@ -131,7 +131,7 @@ Fall back to **CLI** for:
 
 ### Test 5: Documentation Update
 ```
-"Update PROJECT_PLAN.md to check off the first task in Month 1"
+"Update CLAUDE.md to check off the first task in Layer 1"
 ```
 ✅ Should edit documentation files
 
@@ -169,7 +169,7 @@ Fall back to **CLI** for:
 ### Documentation:
 ```
 "Update ARCHITECTURE.md with our decision about [X]"
-"Add this design decision to PROJECT_PLAN.md"
+"Add this design decision to CLAUDE.md"
 "Document the tradeoffs of [approach]"
 ```
 

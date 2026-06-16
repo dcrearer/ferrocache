@@ -4,9 +4,17 @@ A distributed, in-memory key-value cache built in Rust. Redis-like functionality
 
 ## Project Status
 
-**Current Phase:** Month 1 - Architecture & Design  
-**Timeline:** 3-month project  
+**Current State:** ~85% complete — production-ready single-node cache with full observability  
 **Goal:** Production-grade distributed cache suitable for portfolio and technical interviews
+
+| Layer | Status |
+|-------|--------|
+| 1. Single-Node Cache Engine | ✅ Complete |
+| 2. Protocol & API (RESP) | ✅ Complete |
+| 3. Concurrency Model | ✅ Complete |
+| 4. Distribution | ⏸️ Deferred (optional) |
+| 5. Observability (logs + traces + metrics over OTLP) | ✅ Complete |
+| 6. Deployment (Kubernetes) | ⏭️ Next |
 
 ## Quick Start
 
@@ -37,7 +45,7 @@ FerroCache is built in six layers:
 
 See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design.
 
-## Commands (Planned)
+## Commands (Implemented)
 
 - `GET key` - Retrieve value
 - `SET key value [EX seconds]` - Set value with optional TTL
@@ -46,23 +54,28 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design.
 - `TTL key` - Get remaining TTL
 - `PING` - Health check
 
-## Development Timeline
+Connect with any Redis client: `redis-cli -p 6379 PING`.
 
-- **Month 1:** Architecture design + learning
-- **Month 2:** Core implementation (Layers 1-3)
-- **Month 3:** Observability + deployment (Layers 5-6)
+## Observability
 
-See [PROJECT_PLAN.md](PROJECT_PLAN.md) for detailed roadmap.
+All three pillars export over OpenTelemetry (OTLP) to a collector. A ready-to-run
+Elasticsearch + Kibana + APM Server stack lives in [`deploy/`](deploy/).
+
+```bash
+# point FerroCache at a collector (config file or env var)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run
+```
+
+See [deploy/README.md](deploy/README.md) for the full stack and verification steps.
 
 ## Technology Stack
 
-- **Language:** Rust (2024 edition)
+- **Language:** Rust (2021 edition)
 - **Async Runtime:** Tokio
-- **Concurrency:** DashMap or parking_lot (TBD)
+- **Concurrency:** DashMap (sharded lock-free map)
 - **Protocol:** Redis RESP
-- **Logging:** tracing
-- **Metrics:** Prometheus
-- **Deployment:** Kubernetes
+- **Observability:** tracing + OpenTelemetry (OTLP) → Elasticsearch/Kibana
+- **Deployment:** Kubernetes (planned)
 
 ## Project Goals
 
@@ -85,10 +98,10 @@ These are documented to show understanding of the full problem space.
 
 ## Documentation
 
-- [CLAUDE.md](CLAUDE.md) - Project context for Claude Code
+- [CLAUDE.md](CLAUDE.md) - Project context and layer roadmap
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Detailed technical design
-- [PROJECT_PLAN.md](PROJECT_PLAN.md) - Development roadmap
-- [STUDY_PLAN.md](STUDY_PLAN.md) - Interactive learning guide (3-4 hours)
+- [STUDY_PLAN.md](STUDY_PLAN.md) - Interactive learning guide
+- [deploy/README.md](deploy/README.md) - Observability stack (Elasticsearch + Kibana + OTLP)
 - [CLAUDE_WORKFLOW.md](docs/CLAUDE_WORKFLOW.md) - Working with Claude Code
 
 ## License

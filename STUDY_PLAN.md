@@ -1,11 +1,17 @@
-# FerroCache Study Plan - Deep Understanding in 3-4 Hours
+# FerroCache Study Plan
 
 ## Overview
 
 This plan takes you from basics to advanced, ensuring you understand not just WHAT the code does, but WHY we made each design decision. Each section includes theory, code reading, and hands-on exercises.
 
-**Total Time:** 3-4 hours
 **Prerequisites:** Basic Rust knowledge (ownership, traits, concurrency basics)
+
+**Total Time:** ~7 hours end-to-end. It's structured in two halves so you can stop where it makes sense:
+
+- **Core (Phases 1–6, ~4 hours)** — the cache engine, concurrency model, protocol, and benchmarking. This is the foundation; finish here for a solid working understanding.
+- **Going deeper (Phases 7–9, ~3 hours)** — TCP server internals, then observability (the three pillars over OpenTelemetry). Pick these up when you want production-engineering depth.
+
+Each phase is self-contained, so you can also jump straight to a topic you care about.
 
 ---
 
@@ -1069,83 +1075,6 @@ let best = sample.min_by_key(|x| x.score);
 
 ---
 
-## Final Exercise: Explain to a Junior Developer (30 min)
-
-**Task:** Write a 1-page explanation of FerroCache for someone who just learned Rust basics.
-
-**Template:**
-```markdown
-# FerroCache - How It Works
-
-## The Problem
-[Explain what a cache is and why concurrency matters]
-
-## Our Solution
-[Describe the three key innovations: generation-counter LRU, 
-DashMap sharding, two-phase reaper]
-
-## Trade-offs We Made
-[List what we sacrificed and what we gained]
-
-## Performance Results
-[Show benchmark numbers and what they mean]
-
-## Key Takeaways
-[3-5 main lessons you learned]
-```
-
-This exercise forces you to synthesize everything into a coherent narrative. If you can explain it simply, you understand it deeply.
-
----
-
-## Study Checklist
-
-By the end, you should be able to:
-
-- [ ] Explain why Bytes is better than Vec<u8> for cache values
-- [ ] Describe how generation counters provide O(1) LRU
-- [ ] Draw how DashMap shards keys across buckets
-- [ ] Walk through the GET operation step by step
-- [ ] Explain the two-phase reaper design
-- [ ] Describe why Cursor is used in parsing
-- [ ] Write a simple property test
-- [ ] Calculate throughput from benchmark results
-- [ ] Identify contention in performance metrics
-- [ ] Explain all five design patterns we use
-- [ ] **Recognize common benchmarking pitfalls** ⭐ NEW
-- [ ] **Set up benchmarks to exclude overhead** ⭐ NEW
-
----
-
-## Additional Resources
-
-### If you want to go deeper:
-
-**Concurrency:**
-- Book: "Rust Atomics and Locks" by Mara Bos
-- Paper: "A Lock-Free Hash Table" (DashMap is based on this)
-
-**Async Rust:**
-- Tokio tutorial: https://tokio.rs/tokio/tutorial
-- Article: "Async: What is blocking?"
-
-**Property Testing:**
-- proptest book: https://altsysrq.github.io/proptest-book/
-- Paper: "QuickCheck: A Lightweight Tool for Random Testing of Haskell Programs"
-
-**Cache Algorithms:**
-- Paper: "ARC: A Self-Tuning, Low Overhead Replacement Cache"
-- Article: "LRU Approximation Algorithms in Practice"
-
-**Benchmarking:**
-- Criterion.rs User Guide: https://bheisler.github.io/criterion.rs/book/
-- Rust Performance Book: https://nnethercote.github.io/perf-book/
-- Our guide: `docs/BENCHMARK_ACCURACY.md` ⭐ Must-read!
-
----
-
----
-
 ## Phase 7: TCP Server & Command Execution (90 minutes)
 
 ### 7.1 Connection Lifecycle - The Full Journey (20 min)
@@ -1800,9 +1729,351 @@ redis-benchmark -p 6380 -t get,set -n 100000 -q
 
 ---
 
+## Phase 9: Observability - The Three Pillars (90 minutes) ⭐ NEW
+
+This phase implements Layer 5. The guiding idea: **logs, traces, and metrics
+answer different questions, and a cache's hot path constrains how you collect
+each.** All three flow over OpenTelemetry (OTLP) to a vendor-neutral collector,
+so the application is never coupled to a specific backend.
+
+```
+FerroCache --OTLP/gRPC--> OTel Collector --> APM Server --> Elasticsearch --> Kibana
+   (logs + traces + metrics on one pipeline)         (vendor-neutral hub)
+```
+
+### 9.1 The Three Pillars - What Each Answers (15 min)
+
+**Learning Objectives:**
+- [ ] Distinguish what logs, traces, and metrics are each *for*
+- [ ] Understand why a high-throughput cache treats them differently
+- [ ] Grasp the OTLP → collector → backend decoupling
+
+**The mental model:**
+```
+LOGS    — discrete events with context. "What happened, with what detail?"
+          e.g. "evicting key=user:42, memory=99MB/100MB"
+
+TRACES  — causally-linked spans for one request. "Why was THIS request slow?"
+          e.g. connection -> GET span (0.2ms), nested, with timing
+
+METRICS — pre-aggregated numbers over time. "What's the hit rate / p99 / ops/sec?"
+          e.g. cache.hits=1.2M, cache.keys=50k (sampled every 60s)
+```
+
+**The cache-specific tension (the key insight of this phase):**
+```
+A cache does millions of ops/sec, and 99.9% of them are identical
+("hit, 8µs, OK"). This shapes how you collect each pillar:
+
+  LOGS    at info level: almost silent (you do NOT log every GET)
+  TRACES  MUST be sampled — tracing every op drops spans under backpressure
+          AND costs a fortune in backend storage
+  METRICS are the steady-state monitoring tool — always-on, constant-volume,
+          never dropped, cheap (just counters)
+
+Rule of thumb learned here:
+  "Traces are for sampled debugging. Metrics are for monitoring."
+```
+
+**Key Questions:**
+1. Why can't you rely on logs for "what's the current hit rate"?
+   - Hint: At `info` level there are no per-request logs to count.
+
+2. Why does 100% tracing fail at cache throughput?
+   - Hint: We measured ~74% span loss at 55k ops/sec. Where do they go?
+
+3. Why route through an OTel Collector instead of writing to ES directly?
+   - Hint: What changes in the app if you later swap ES for Jaeger?
+
+---
+
+### 9.2 Structured Logging with tracing (15 min)
+
+**Files:** `src/server/connection.rs`, `src/expiration/reaper.rs`, `src/cache/storage.rs`
+
+**Learning Objectives:**
+- [ ] Use structured fields, not string interpolation
+- [ ] Choose log levels deliberately (info vs debug)
+- [ ] Log at boundaries, never on the hot path
+
+**Structured fields vs string-formatting:**
+```rust
+// ❌ Stringly-typed — can't filter/aggregate on it later
+warn!("parse error from {}: {:?}", peer, e);
+
+// ✅ Structured — `peer` and `error` become queryable fields
+warn!(peer = %self.peer, error = ?e, "protocol parse error, closing connection");
+```
+
+**Deliberate level choice (from the reaper):**
+```rust
+// info = a real state change worth seeing in production
+// debug = noise you only want when investigating
+if removed > 0 {
+    info!(scanned, removed, "reaper sweep complete");
+} else {
+    debug!(scanned, "reaper sweep, nothing expired");  // every 60s — keep it quiet
+}
+```
+
+**Where NOT to log:** `entry.rs`, `lru.rs`, the byte parser. These are hot paths;
+a log per access would be noise and a perf drag. Log at *boundaries* (connection,
+command, eviction, reaper) and *state changes*, not in tight loops.
+
+**Key Questions:**
+1. Why is `warn!(peer = %x)` better than `warn!("peer {}", x)` for shipping to ES?
+   - Hint: How does Kibana index a field it can't see as a field?
+
+2. Why is the empty reaper sweep at `debug`, not `info`?
+   - Hint: It fires every 60s forever. What would `info` logs look like?
+
+3. The eviction log is at `debug`. Why not `info`?
+   - Hint: Under memory pressure, how often does `evict_one()` fire?
+
+**Hands-On Exercise:**
+```bash
+# info level: quiet — only lifecycle + meaningful reaper sweeps
+RUST_LOG=ferrocache=info cargo run
+
+# debug level: see every command and connection
+RUST_LOG=ferrocache=debug cargo run
+# then: redis-cli -p 6379 SET foo bar
+# Watch: client connected -> executing command -> command response
+```
+
+---
+
+### 9.3 Distributed Tracing with Spans (20 min)
+
+**Files:** `src/telemetry.rs`, `src/server/connection.rs`
+
+**Learning Objectives:**
+- [ ] Understand spans, nesting, and trace context
+- [ ] Instrument the *unit of work*, not every function
+- [ ] Keep span attributes low-cardinality
+
+**The span hierarchy (3 spans, all at boundaries):**
+```
+connection{peer=127.0.0.1:54321}     ← one per client, whole session
+  └─ GET / SET / DEL ...             ← one per command (the unit of work)
+                                        span duration = per-op latency
+reaper_sweep{scanned, removed}       ← background-task latency
+```
+
+**The most important design decision — instrument the unit of work:**
+```
+We DO span: connection, each command, reaper sweep
+We do NOT span: storage.get/set, lru.select_victim, the byte parser
+
+Why: those are hot paths. A span per cache op adds overhead on every
+operation and buries the signal. The `command` span already wraps the
+storage call, so storage latency is captured WITHOUT per-op cost.
+```
+
+**Low-cardinality naming (this matters a lot):**
+```rust
+// Span is NAMED by command TYPE — never the key.
+// "GET" aggregates cleanly in APM. "GET user:1234" would explode the
+// backend's index and make aggregation impossible.
+fn command_span(command: &RespCommand) -> tracing::Span {
+    match command {
+        RespCommand::Get(_) => info_span!("GET"),
+        RespCommand::Set(_, _, _) => info_span!("SET"),
+        // ...
+    }
+}
+```
+
+**How init wires it (telemetry.rs):** the OTLP span exporter feeds a
+`tracing-opentelemetry` layer, so the SAME `tracing` calls produce both stdout
+logs and exported spans. Logs ride on their enclosing span as span events.
+
+**Key Questions:**
+1. Why name the span `GET` instead of one `command` span with a `cmd` field?
+   - Hint: How does APM break down latency per operation?
+
+2. Why not put the cache key in the span?
+   - Hint: How many unique span names would a million keys create?
+
+3. Why instrument `handle_value` but not `storage.get`?
+   - Hint: How many times per second does each run?
+
+**Hands-On Exercise:**
+```bash
+# With the collector up (see 9.5), enable export and watch nesting:
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 RUST_LOG=ferrocache=debug cargo run
+# In the logs you'll see span context prefix each line:
+#   connection{peer=...}:GET: executing command ...
+```
+
+---
+
+### 9.4 Metrics - The Hot-Path Problem (20 min)
+
+**Files:** `src/cache/metrics.rs`, `src/cache/storage.rs`, `src/telemetry.rs`
+
+**Learning Objectives:**
+- [ ] Understand why metrics can't naively touch the OTel SDK on the hot path
+- [ ] Learn the lock-free-atomics + observable-instrument bridge
+- [ ] Know the minimal set of metrics a cache operator watches
+
+**The hot-path problem:**
+```
+get()/set() run millions of times/sec. Two ways to count a hit:
+
+❌ Naive: call otel_counter.add(1) inside get()
+   → crosses into the metrics SDK on EVERY op
+   → overhead + contention, undermines the lock-free design
+
+✅ Well-architected: bump a relaxed atomic in get() (~free),
+   and let an OTel *observable* instrument READ that atomic on the
+   SDK's collection interval (every 60s) — OFF the hot path.
+```
+
+**The bridge (telemetry.rs):**
+```rust
+// Hot path only touches CacheMetrics atomics (record_hit/miss/eviction).
+// These observable instruments read the totals off-path on a timer:
+meter
+    .u64_observable_counter("ferrocache.cache.hits")
+    .with_callback(move |o| o.observe(metrics.hit_count(), &[]))
+    .build();
+```
+
+**The minimal metric set (not 50 metrics — the handful operators watch):**
+```
+cache.hits / cache.misses    → hit rate (THE #1 cache health signal)
+cache.evictions              → memory pressure / churn
+cache.memory.used_bytes      → capacity headroom (gauge)
+cache.keys                   → size (gauge)
+command.duration             → p50/p95/p99 latency, per command (histogram)
+```
+
+**Why this is the production monitoring tool:** unlike traces, these are
+always-on, constant-volume regardless of throughput, and never dropped. At
+`info` level with no per-request logs, metrics are how you actually *see* the
+cache.
+
+**Key Questions:**
+1. Why use an *observable* counter instead of calling `.add(1)` in `get()`?
+   - Hint: How many times per second would `.add(1)` run?
+
+2. Why are `hits`/`misses` counters but `memory.used`/`keys` gauges?
+   - Hint: One only goes up; the other goes up and down.
+
+3. Why tag `command.duration` by command type but bound the tag set?
+   - Hint: What if you tagged it by key instead?
+
+**Hands-On Exercise:**
+```bash
+# Drive a known hit/miss ratio, then check the metric in ES:
+#   100 SET, 100 GET(existing)=hits, 50 GET(missing)=misses
+#   expected hit rate = 100/150 = 66.7%
+curl -s 'http://localhost:9200/metrics-apm*/_search?size=1' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"exists":{"field":"ferrocache.cache.hits"}},
+       "sort":[{"@timestamp":"desc"}]}'
+```
+
+---
+
+### 9.5 Config-Driven Telemetry & The Unified Stack (20 min)
+
+**Files:** `src/config.rs`, `ferrocache.toml.example`, `deploy/`
+
+**Learning Objectives:**
+- [ ] Layer configuration: defaults → file → env overrides
+- [ ] Run the full Elastic + APM + Collector stack
+- [ ] Understand why the collector is the architectural hub
+
+**Config layering (never recompile to change an endpoint):**
+```
+1. Built-in defaults        (Default impls)
+2. TOML file                (ferrocache.toml / $FERROCACHE_CONFIG)
+3. Environment variables    (RUST_LOG, LOG_FORMAT, OTEL_EXPORTER_OTLP_ENDPOINT)
+
+File = human-edited source of truth. Env = per-environment override for
+containers/k8s, and honors the standard OTEL_* variable.
+```
+
+```toml
+# ferrocache.toml
+[observability]
+log_filter   = "ferrocache=debug"
+log_format   = "json"                       # pretty for dev, json for shipping
+otlp_endpoint = "http://localhost:4317"      # unset = zero tracing overhead
+```
+
+**The unified stack (`deploy/docker-compose.yaml`):**
+```
+FerroCache → OTel Collector (:4317) → APM Server (:8200) → Elasticsearch → Kibana
+```
+The Collector is the vendor-neutral hub: swapping Elasticsearch for Jaeger/Tempo
+is a *collector-config* change, never an app change. The APM Server routes OTLP
+into APM-native data streams (`traces-apm-*`, `logs-apm-*`, `metrics-apm-*`) so
+Kibana's APM UI works directly.
+
+**Key Questions:**
+1. Why does env override file (not the reverse)?
+   - Hint: Same container image, three environments. Edit the image each time?
+
+2. Why forward to an APM Server instead of the collector's ES exporter?
+   - Hint: We tried direct-to-ES first. Which data streams did APM UI read?
+
+3. What's the one prerequisite that makes ES refuse to start under Podman?
+   - Hint: `vm.max_map_count` — and it's set inside the VM, not on the Mac.
+
+**Hands-On Exercise:**
+```bash
+# 1. Prereq (Podman VM): ES needs this or it won't boot
+podman machine ssh 'sudo sysctl -w vm.max_map_count=262144'
+
+# 2. Bring up the stack
+cd deploy && podman compose up -d
+
+# 3. Run FerroCache pointed at the collector
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run
+
+# 4. Drive traffic, then explore in Kibana (http://localhost:5601):
+#    - APM:      service "ferrocache" (traces + latency)
+#    - Discover: logs-apm* and metrics-apm* data views
+```
+
+**Read This:** `deploy/README.md` for the full stack setup and gotchas.
+
+---
+
+### 9.6 Production Hardening - What's Still Missing (Discussion, 10 min)
+
+The pillars are implemented and verified end-to-end, but a load test exposed
+real gaps worth understanding before calling this production-ready:
+
+```
+1. TRACE SAMPLING (not yet implemented)
+   - 100% tracing dropped ~74% of spans at 55k ops/sec (queue overflow).
+   - Random drops lose the INTERESTING spans (errors, slow ops).
+   - Fix: deliberate sampling. Head-sampling ratio in-app (config knob) +
+     tail-sampling in the collector (keep errors + slow, sample the rest).
+
+2. SPAN ERROR STATUS
+   - Failed commands don't mark the span as ERROR, so you can't filter
+     failures in APM. Small enrichment, high diagnostic value.
+
+3. METRIC EXPORT INTERVAL
+   - Hardcoded 60s. Fine for a cache, but should be config-driven.
+
+4. KIBANA DASHBOARDS
+   - Data is queryable; saved dashboards/visualizations aren't built yet.
+```
+
+**Key Question:** Why is sampling a *traces* concern but not a *metrics* concern?
+   - Hint: Which one's data volume scales with request throughput?
+
+---
+
 ## Next Steps
 
-After completing Phases 1-7, you'll have a deep understanding of:
+After completing Phases 1-9, you'll have a deep understanding of:
 - Concurrent data structures (DashMap, atomics)
 - Lock-free algorithms (generation counters)
 - Async programming (Tokio, background tasks, select!)
@@ -1814,18 +2085,56 @@ After completing Phases 1-7, you'll have a deep understanding of:
 - Error handling strategies
 - Deadlock prevention
 - Graceful shutdown patterns
+- **Observability: the three pillars (logs, traces, metrics)** ⭐ NEW
+- **OpenTelemetry instrumentation & the hot-path constraint** ⭐ NEW
+- **Config-layered telemetry + a unified Elastic/OTLP stack** ⭐ NEW
 
 **You'll be ready to:**
 1. Add new commands confidently
 2. Debug connection issues
 3. Optimize performance bottlenecks
-4. Move on to Layer 5 (Observability - metrics, tracing, health checks)
+4. Instrument a service across all three observability pillars
+5. Reason about sampling, cardinality, and hot-path collection cost
+6. Move on to Layer 6 (Deployment - Docker, Kubernetes)
 
-**Current Project Status:** ~70% complete
+**Current Project Status:** ~85% complete
 - ✅ Layer 1: Cache Engine
 - ✅ Layer 2: Protocol
 - ✅ Layer 3: Server & Concurrency
-- ⏭️ Layer 5: Observability
+- ✅ Layer 5: Observability (logs + traces + metrics over OTLP → Elastic)
 - ⏭️ Layer 6: Deployment
 
-Good luck! 🚀
+**Layer 5 caveats (see Phase 9.6):** trace sampling, span error status, and
+config-driven metric interval remain as production-hardening work.
+
+---
+
+## Additional Resources
+
+### If you want to go deeper:
+
+**Concurrency:**
+- Book: "Rust Atomics and Locks" by Mara Bos
+- Paper: "A Lock-Free Hash Table" (DashMap is based on this)
+
+**Async Rust:**
+- Tokio tutorial: https://tokio.rs/tokio/tutorial
+- Article: "Async: What is blocking?"
+
+**Property Testing:**
+- proptest book: https://altsysrq.github.io/proptest-book/
+- Paper: "QuickCheck: A Lightweight Tool for Random Testing of Haskell Programs"
+
+**Cache Algorithms:**
+- Paper: "ARC: A Self-Tuning, Low Overhead Replacement Cache"
+- Article: "LRU Approximation Algorithms in Practice"
+
+**Benchmarking:**
+- Criterion.rs User Guide: https://bheisler.github.io/criterion.rs/book/
+- Rust Performance Book: https://nnethercote.github.io/perf-book/
+- Our guide: `docs/BENCHMARK_ACCURACY.md` ⭐ Must-read!
+
+**Observability:**
+- OpenTelemetry Rust docs: https://opentelemetry.io/docs/languages/rust/
+- `tracing` crate docs: https://docs.rs/tracing/
+- Our stack guide: `deploy/README.md` ⭐ Must-read!
