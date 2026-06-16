@@ -1,0 +1,39 @@
+# FerroCache configuration (example)
+#
+# Copy this file to `ferrocache.toml` (next to the binary, or point at it with
+# the FERROCACHE_CONFIG env var) and edit as needed. Every field is optional —
+# anything omitted falls back to the built-in default shown below.
+#
+# Precedence: built-in defaults < this file < environment variables.
+# Env overrides: RUST_LOG, LOG_FORMAT, OTEL_EXPORTER_OTLP_ENDPOINT,
+# FERROCACHE_BIND_ADDR.
+
+[server]
+# Address the RESP server listens on.
+bind_addr = "127.0.0.1:6379"
+# Cache memory budget, in megabytes. LRU eviction kicks in past this.
+memory_limit_mb = 100
+# How often the background expiration reaper scans for expired keys, in seconds.
+reaper_interval_secs = 60
+
+[observability]
+# Log/span filter directives — same syntax as RUST_LOG.
+# Examples: "info", "ferrocache=debug", "ferrocache=debug,tower=warn"
+log_filter = "info"
+
+# Stdout log format: "pretty" (human-readable, for local dev) or
+# "json" (structured, for shipping to Elasticsearch via a log collector).
+log_format = "pretty"
+
+# OTLP/gRPC collector endpoint for trace + metric export. Uncomment to enable.
+# When unset, nothing is exported and there is zero telemetry overhead.
+# otlp_endpoint = "http://localhost:4317"
+
+# Fraction of traces to sample, 0.0–1.0 (head sampling). 1.0 = sample all
+# (fine for dev/low volume). Under high throughput, lower this so the span
+# export queue isn't overwhelmed — e.g. 0.01 keeps 1% of traces. For
+# keep-errors / keep-slow policies, do tail sampling in the collector instead.
+trace_sample_ratio = 1.0
+
+# How often (seconds) metrics are pushed to the collector.
+metric_export_interval_secs = 60
