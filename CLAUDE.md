@@ -52,19 +52,31 @@ FerroCache is a distributed, in-memory key-value cache (Redis-like) built in Rus
 
 **Status:** Deferred - single-node implementation complete
 
-### 🚧 Layer 5: Observability (Next Priority)
-- Prometheus metrics: hit/miss rate, latency percentiles, evictions, memory, connections
-- Structured logging with `tracing` crate and span context
-- HTTP `/health` and `/metrics` endpoints alongside cache protocol
+### ✅ Layer 5: Observability - COMPLETE
+- ✅ Metrics over OpenTelemetry: hit/miss, evictions, memory, keys, per-command latency histogram
+- ✅ Structured logging with `tracing` and span context
+- ✅ Distributed tracing: boundary spans (connection → command → reaper) with config-driven head sampling and ERROR status on failures
+- ✅ Export over OTLP/gRPC to an OpenTelemetry Collector (vendor-neutral)
 
-**Status:** Not started - ready to implement
+**Implemented:**
+- `telemetry.rs`: OTLP tracer + meter providers, config-driven sampling and export interval, graceful flush on shutdown
+- `CacheMetrics` lock-free atomics bridged to OTel observable instruments (off the hot path)
+- Unified deploy stack in `deploy/`: Collector → APM Server → Elasticsearch → Kibana
 
-### ⏸️ Layer 6: Deployment (Future Work)
+**Note:** Used OTLP-to-collector instead of a built-in Prometheus `/metrics`
+endpoint — keeps the app vendor-neutral and carries all three pillars over one
+pipeline. A standalone HTTP `/health` + `/metrics` endpoint is still open if a
+pull-based scrape is wanted.
+
+**Remaining hardening:** collector-side tail sampling (keep-errors/keep-slow);
+optional `/health` HTTP endpoint.
+
+### ⏸️ Layer 6: Deployment (Next Priority)
 - Multi-stage Dockerfile with minimal final image
 - Kubernetes manifests: StatefulSet, headless Service, HPA
 - Helm chart or Kustomize for environment templating
 
-**Status:** Not started - waiting for observability layer
+**Status:** Not started - observability layer complete, this is next
 
 ## Development Guidelines
 
@@ -147,13 +159,15 @@ Mentioning these shows understanding of full problem space without over-scoping.
 
 ## Development Timeline
 - **Month 1** (Complete): Architecture design and learning
-- **Month 2-3** (In Progress): 
+- **Month 2-3** (In Progress):
   - ✅ Layers 1-3 complete (cache engine, protocol, TCP server)
-  - 🚧 Layer 5 next (observability)
-  - ⏸️ Layer 6 after (deployment)
+  - ✅ Layer 5 complete (observability: logs + traces + metrics over OTLP)
+  - 🚧 Layer 6 next (deployment)
   - ⏸️ Layer 4 optional (distribution)
 
-**Current Status (2026-05-30):** ~70% complete, production-ready single-node cache
+**Current Status (2026-06-16):** ~85% complete — production-ready single-node
+cache with full three-pillar observability over OpenTelemetry. Deployment
+(Layer 6) is next.
 
 ## Build & Test Commands
 ```bash
