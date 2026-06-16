@@ -25,7 +25,12 @@ pub struct CacheEntry {
 
 impl CacheEntry {
     /// Create a new cache entry
-    pub fn new(value: Bytes, expires_at: Option<Instant>, generation: u64, key_size: usize) -> Self {
+    pub fn new(
+        value: Bytes,
+        expires_at: Option<Instant>,
+        generation: u64,
+        key_size: usize,
+    ) -> Self {
         let size_bytes = Self::calculate_size(&value, key_size);
 
         Self {
@@ -48,8 +53,7 @@ impl CacheEntry {
 
     /// Check if this entry has expired
     pub fn is_expired(&self) -> bool {
-        self.expires_at
-            .map_or(false, |exp| exp <= Instant::now())
+        self.expires_at.map_or(false, |exp| exp <= Instant::now())
     }
 
     /// Update the access generation (called on GET operations)

@@ -1,34 +1,54 @@
+use ferrocache::config::Config;
 use ferrocache::server::{Server, ServerConfig};
 use ferrocache::expiration::reaper::ExpirationReaper;
+use ferrocache::telemetry;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn, error};
-use tracing_subscriber::{EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info"))
-        )
-        .init();
+    // Load configuration: defaults -> TOML file -> env overrides. This happens
+    // before telemetry init so logging is configured from the file too.
+    let config = Config::load()?;
 
-    // Parse config (for now, use defaults)
-    let config = ServerConfig::default();
+    // Initialize logging + (optional) OTLP trace export. The guard must live
+    // for the whole program: dropping it flushes buffered spans on exit.
+    let _telemetry = telemetry::init(&config.observability)?;
+
+    let server_config = ServerConfig {
+        bind_addr: config.server.bind_addr.clone(),
+        memory_limit: config.server.memory_limit_bytes(),
+    };
 
     info!("Starting FerroCache...");
-    info!("Memory limit: {} MB", config.memory_limit / (1024 * 1024));
-    info!("Binding to: {}", config.bind_addr);
+    info!("Memory limit: {} MB", config.server.memory_limit_mb);
+    info!("Binding to: {}", server_config.bind_addr);
+    if let Some(endpoint) = &config.observability.otlp_endpoint {
+        info!(
+            "OTLP export enabled: {} (trace sample ratio {:.3}, metric interval {}s; \
+             collector-down is non-fatal)",
+            endpoint,
+            config.observability.sample_ratio_clamped(),
+            config.observability.metric_export_interval_secs,
+        );
+    } else {
+        info!("OTLP export disabled (stdout logging only)");
+    }
 
     // Create server wrapped in Arc for shared ownership
-    let server = Arc::new(Server::new(config));
+    let server = Arc::new(Server::new(server_config));
+
+    // Register observable cache metrics (hit/miss/eviction/memory/keys). These
+    // read the cache's lock-free atomics off the hot path on the OTel SDK's
+    // collection interval. No-op if OTLP export is disabled.
+    telemetry::register_cache_metrics(server.cache());
 
     // Start expiration reaper (background task)
     let reaper = ExpirationReaper::new(
         server.cache().clone(),
-        Duration::from_secs(60), // Scan every 60 seconds
+        Duration::from_secs(config.server.reaper_interval_secs),
     );
     let reaper_handle = tokio::spawn(reaper.run());
 

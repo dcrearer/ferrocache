@@ -1,6 +1,7 @@
 use crate::cache::storage::CacheStorage;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, info, instrument};
 
 /// Background task that periodically removes expired keys from the cache.
 ///
@@ -54,6 +55,11 @@ impl ExpirationReaper {
         // This uses Tokio's internal timer wheel for efficient scheduling
         let mut interval = tokio::time::interval(self.interval);
 
+        info!(
+            interval_secs = self.interval.as_secs(),
+            "expiration reaper started"
+        );
+
         loop {
             // Wait for the next tick
             // First tick completes immediately, subsequent ticks wait `interval`
@@ -82,7 +88,9 @@ impl ExpirationReaper {
     /// - Minimizes write lock contention (only during removal)
     /// - Read iteration is concurrent with cache operations
     /// - Batch removal is more efficient than remove-while-iterating
+    #[instrument(skip(self), name = "reaper_sweep")]
     async fn reap_expired(&self) {
+        let scanned = self.cache.len();
         let mut to_remove = Vec::new();
 
         // Phase 1: Collect expired keys (read-only iteration)
@@ -101,8 +109,17 @@ impl ExpirationReaper {
 
         // Phase 2: Remove expired keys
         // Each remove() acquires its own lock, so this is concurrent-safe
+        let removed = to_remove.len();
         for key in to_remove {
             self.cache.remove(&key);
+        }
+
+        // Log at info when we actually reaped something (a real state change),
+        // and at debug for empty sweeps to avoid flooding logs every interval.
+        if removed > 0 {
+            info!(scanned, removed, "reaper sweep complete");
+        } else {
+            debug!(scanned, "reaper sweep, nothing expired");
         }
     }
 }

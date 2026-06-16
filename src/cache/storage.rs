@@ -1,4 +1,4 @@
-use crate::cache::{entry::CacheEntry, lru::LruTracker};
+use crate::cache::{entry::CacheEntry, lru::LruTracker, metrics::CacheMetrics};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::{
@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 /// Core cache storage engine with concurrent access, LRU eviction, and memory budgeting.
 ///
@@ -34,6 +35,11 @@ pub struct CacheStorage {
 
     /// Maximum memory budget in bytes
     memory_limit: usize,
+
+    /// Lock-free operational metrics (hits, misses, evictions).
+    /// Updated on the hot path via relaxed atomics; read off-path by the
+    /// telemetry layer's observable OTel instruments.
+    metrics: Arc<CacheMetrics>,
 }
 
 impl CacheStorage {
@@ -47,7 +53,17 @@ impl CacheStorage {
             lru: Arc::new(LruTracker::new()),
             memory_used: AtomicUsize::new(0),
             memory_limit,
+            metrics: Arc::new(CacheMetrics::new()),
         }
+    }
+
+    /// Shared handle to the operational metrics.
+    ///
+    /// The telemetry layer clones this `Arc` and reads the atomics from OTel
+    /// observable instruments on the SDK's collection interval — keeping metric
+    /// export entirely off the cache's hot path.
+    pub fn metrics(&self) -> Arc<CacheMetrics> {
+        self.metrics.clone()
     }
 
     /// Get a value from the cache
@@ -60,12 +76,19 @@ impl CacheStorage {
     /// - Updates LRU generation (marks as recently used)
     /// - Returns cloned Bytes (cheap Arc increment)
     pub fn get(&self, key: &str) -> Option<Bytes> {
-        let entry = self.store.get(key)?;
+        let entry = match self.store.get(key) {
+            Some(entry) => entry,
+            None => {
+                self.metrics.record_miss();
+                return None;
+            }
+        };
 
-        // Lazy expiration check
+        // Lazy expiration check — an expired entry is a miss.
         if entry.is_expired() {
             drop(entry); // Release read lock before removing
             self.remove(key);
+            self.metrics.record_miss();
             return None;
         }
 
@@ -73,6 +96,7 @@ impl CacheStorage {
         let generation = self.lru.next_generation();
         entry.update_generation(generation);
 
+        self.metrics.record_hit();
         Some(entry.value.clone())
     }
 
@@ -190,7 +214,14 @@ impl CacheStorage {
         }
 
         let victim_key = self.lru.select_victim(&candidates);
+        debug!(
+            key = %victim_key,
+            memory_used = self.memory_used(),
+            memory_limit = self.memory_limit,
+            "evicting entry (memory pressure)"
+        );
         self.remove(&victim_key);
+        self.metrics.record_eviction();
     }
 
     /// Get current memory usage in bytes

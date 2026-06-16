@@ -29,6 +29,15 @@ pub struct CacheMetrics {
     /// Total number of SET operations
     set_count: AtomicU64,
 
+    /// GET operations that found a live (non-expired) entry
+    hit_count: AtomicU64,
+
+    /// GET operations that found nothing (missing or expired)
+    miss_count: AtomicU64,
+
+    /// Entries removed by LRU eviction under memory pressure
+    eviction_count: AtomicU64,
+
     /// Number of operations that experienced contention
     /// (defined as lock wait time > threshold)
     contention_events: AtomicU64,
@@ -43,9 +52,48 @@ impl CacheMetrics {
         Self {
             get_count: AtomicU64::new(0),
             set_count: AtomicU64::new(0),
+            hit_count: AtomicU64::new(0),
+            miss_count: AtomicU64::new(0),
+            eviction_count: AtomicU64::new(0),
             contention_events: AtomicU64::new(0),
             total_lock_wait_ns: AtomicU64::new(0),
         }
+    }
+
+    /// Record a cache hit (GET found a live entry).
+    ///
+    /// Hot-path safe: a single relaxed atomic increment, no locks. This is the
+    /// primitive that OTel observable instruments read off the hot path.
+    #[inline]
+    pub fn record_hit(&self) {
+        self.hit_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a cache miss (GET found nothing or an expired entry).
+    #[inline]
+    pub fn record_miss(&self) {
+        self.miss_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an eviction (entry removed under memory pressure).
+    #[inline]
+    pub fn record_eviction(&self) {
+        self.eviction_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total cache hits.
+    pub fn hit_count(&self) -> u64 {
+        self.hit_count.load(Ordering::Relaxed)
+    }
+
+    /// Total cache misses.
+    pub fn miss_count(&self) -> u64 {
+        self.miss_count.load(Ordering::Relaxed)
+    }
+
+    /// Total evictions.
+    pub fn eviction_count(&self) -> u64 {
+        self.eviction_count.load(Ordering::Relaxed)
     }
 
     /// Record a GET operation
@@ -129,10 +177,25 @@ impl CacheMetrics {
         Duration::from_nanos(total_ns / total_ops)
     }
 
+    /// Hit rate as a fraction 0.0–1.0 (hits / (hits + misses)).
+    /// Returns 0.0 when there have been no gets.
+    pub fn hit_rate(&self) -> f64 {
+        let hits = self.hit_count();
+        let total = hits + self.miss_count();
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
     /// Reset all metrics (useful for benchmarking)
     pub fn reset(&self) {
         self.get_count.store(0, Ordering::Relaxed);
         self.set_count.store(0, Ordering::Relaxed);
+        self.hit_count.store(0, Ordering::Relaxed);
+        self.miss_count.store(0, Ordering::Relaxed);
+        self.eviction_count.store(0, Ordering::Relaxed);
         self.contention_events.store(0, Ordering::Relaxed);
         self.total_lock_wait_ns.store(0, Ordering::Relaxed);
     }
@@ -143,6 +206,11 @@ impl CacheMetrics {
         println!("Total operations: {}", self.total_ops());
         println!("  GET: {}", self.get_count());
         println!("  SET: {}", self.set_count());
+        println!("Hits: {} / Misses: {} ({:.1}% hit rate)",
+                 self.hit_count(),
+                 self.miss_count(),
+                 self.hit_rate() * 100.0);
+        println!("Evictions: {}", self.eviction_count());
         println!("Contention events: {} ({:.2}%)",
                  self.contention_events(),
                  self.contention_percentage());
