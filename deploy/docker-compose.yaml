@@ -1,0 +1,86 @@
+# FerroCache unified observability stack: Elasticsearch + Kibana + OTel Collector.
+#
+# All three pillars (logs, traces, metrics) flow through the OTel Collector into
+# Elasticsearch and are viewed in Kibana:
+#   - traces  -> Observability > APM
+#   - logs    -> Discover / Logs
+#   - metrics -> Discover / dashboards
+#
+# Works with `podman compose` or `docker compose`. See deploy/README.md for the
+# Podman-specific prerequisites (notably vm.max_map_count).
+#
+# This is a LOCAL DEV stack: security is disabled and a single ES node is used.
+# Do NOT use this configuration in production.
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: ferrocache-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false        # local dev only — no TLS/auth
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g          # cap heap so it fits a laptop
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    healthcheck:
+      # Gate dependents until ES actually answers, not just when the port opens.
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: ferrocache-kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q 'available'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  apm-server:
+    image: docker.elastic.co/apm/apm-server:8.15.3
+    container_name: ferrocache-apm
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    command: ["--strict.perms=false", "-e"]
+    volumes:
+      - ./apm-server.yml:/usr/share/apm-server/apm-server.yml:ro,Z
+    ports:
+      - "8200:8200"   # OTLP/HTTP+gRPC intake from the collector
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:8200/ | grep -q 'publish_ready' || curl -sf http://localhost:8200/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    container_name: ferrocache-otelcol
+    depends_on:
+      apm-server:
+        condition: service_started
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro,Z
+    ports:
+      - "4317:4317"   # OTLP gRPC  — FerroCache connects here from the host
+      - "4318:4318"   # OTLP HTTP  — alternative ingest
+
+volumes:
+  es-data:

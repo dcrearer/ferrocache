@@ -1,0 +1,27 @@
+# Elastic APM Server config for the FerroCache stack.
+#
+# Receives OTLP (forwarded by the OTel Collector) and writes to Elasticsearch
+# using APM-native data streams (traces-apm-*, logs-apm-*, metrics-apm-*) that
+# Kibana's APM UI reads directly.
+#
+# LOCAL DEV ONLY: anonymous/no-auth intake and security disabled.
+
+apm-server:
+  host: "0.0.0.0:8200"
+
+  # Accept OTLP from the collector without an API key / secret token.
+  auth:
+    anonymous:
+      enabled: true
+      allow_agent: ["*"]
+      allow_service: ["*"]
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  # ES security is disabled in this local stack, so no credentials needed.
+
+# Send APM Server's own logs to stdout so `podman compose logs apm-server`
+# shows intake/output activity for debugging.
+logging:
+  level: info
+  to_stderr: true
